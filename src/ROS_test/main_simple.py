@@ -1,7 +1,7 @@
 """单电机控制示例 - 简化版本"""
 import time
 from can_driver import CANDriver
-from multi_motor_manager import MultiMotorManager
+from ROS_test.multi_motor_manager import MultiMotorManager
 
 # === 配置 ===
 MOTOR_ID = 1

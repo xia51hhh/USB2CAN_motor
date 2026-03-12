@@ -2,7 +2,7 @@ import time
 import sys
 import signal
 from can_driver import CANDriver
-from multi_motor_manager import MultiMotorManager
+from ROS_test.multi_motor_manager import MultiMotorManager
 from pid import PID
 
 # === 全局变量用于信号处理 ===
@@ -27,7 +27,7 @@ USE_ROS = '--ros' in sys.argv
 if USE_ROS:
     try:
         import rospy
-        import ros_angle_updater
+        import ROS_test.ros_angle_updater as ros_angle_updater
         
         # 初始化ROS
         try:

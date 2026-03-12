@@ -163,7 +163,7 @@ def main():
         return
     
     # 电机参数（与官方SDK相同）
-    motor_id = 0
+    motor_id = 3
     mode = 1 # FOC模式
     k_pos = 0.20 # 刚度系数
     k_spd = 0.04   # 阻尼系数
