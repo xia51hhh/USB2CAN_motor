@@ -163,7 +163,8 @@ def main():
         return
     
     # 电机参数（与官方SDK相同）
-    motor_id = 3
+    
+    motor_id =[0, 1, 3] # 电机ID列表
     mode = 1 # FOC模式
     k_pos = 0.00 # 刚度系数
     k_spd = 0.00   # 阻尼系数
@@ -181,8 +182,9 @@ def main():
     try:
         while True:
             # 创建命令 (使用定点数格式)
+          for i in range(len(motor_id)):  
             cmd = create_motor_command(
-                motor_id=motor_id,
+                motor_id=motor_id[i-1],
                 mode=mode,
                 tau=0.0,
                 spd_des=target_speed,
@@ -209,7 +211,7 @@ def main():
                 feedback = parse_motor_feedback(response)
                 if feedback:
                     success += 1
-                    print(f"[{count:2d}] CRC=0x{crc:04X} ✓ | "
+                    print(f"[{count:2d}] id={feedback['id']} CRC=0x{crc:04X} ✓ | "
                           f"pos={feedback['pos']:9.2f} | "
                           f"spd={feedback['speed']:8.2f} | "
                           f"T={feedback['temp']:3d}°C | "

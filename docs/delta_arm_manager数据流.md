@@ -1,17 +1,83 @@
 # delta_arm_manager 节点数据流分析
 
+> 快速使用方法见下方“0. 使用方法（实操）”。
+
+## 0. 使用方法（实操）
+
+### 13.1 编译与环境
+
+```bash
+cd ~/111/USB2CAN_motor
+colcon build --packages-select motor_control_ros2
+source install/setup.bash
+```
+
+### 13.2 启动顺序
+
+1) 先启动底层电机节点
+
+```bash
+ros2 run motor_control_ros2 motor_control_node
+```
+
+2) 再启动机械臂管理节点
+
+```bash
+source ~/111/USB2CAN_motor/install/setup.bash
+ros2 run motor_control_ros2 delta_arm_manager
+```
+
+### 13.3 READY 检查
+
+```bash
+ros2 topic echo /delta_arm/ready
+```
+
+出现 `data: READY` 后再发送目标。
+
+### 13.4 发送目标（统一 Δrad）
+
+> `target_angles[3]` 必须三路相同。
+
+```bash
+# 上升 +0.30 rad
+ros2 topic pub --once /delta_arm/target motor_control_ros2/msg/ArmTarget \
+  "{target_angles: [0.30, 0.30, 0.30], execute: true}"
+
+# 回到零点
+ros2 topic pub --once /delta_arm/target motor_control_ros2/msg/ArmTarget \
+  "{target_angles: [0.0, 0.0, 0.0], execute: true}"
+
+# 下降 -0.20 rad
+ros2 topic pub --once /delta_arm/target motor_control_ros2/msg/ArmTarget \
+  "{target_angles: [-0.20, -0.20, -0.20], execute: true}"
+```
+
+### 13.5 运行观测
+
+```bash
+ros2 topic echo /unitree_go8010_states
+ros2 topic echo /unitree_go8010_command
+```
+
+### 13.6 注意事项
+
+- READY 前发目标会被拒绝。
+- 三路增量不一致会被拒绝。
+- 仅启动 manager 不启动 motor_control_node，不会有电机动作。
+
 ## 1. 系统拓扑
 
 ```
                     /delta_arm/target (ArmTarget)
-                        │  target_angles[3], execute
+                        │  target_angles[3](Δrad且三路一致), execute
                         ▼
              ┌──────────────────────────────┐
              │       delta_arm_manager      │  配置: arm_config.yaml
              │                              │  ├─ control_frequency (200 Hz)
              │  状态机:                     │  ├─ initialization.downward_torque
              │    INIT → SOFT_LANDING       │  ├─ initialization.landing_timeout
-             │    SOFT_LANDING → READY      │  ├─ initialization.landing_angle_threshold
+             │    SOFT_LANDING → READY      │  ├─ initialization.landing_delta_threshold
              │    READY → EXECUTE → READY   │  ├─ initialization.landing_stable_duration
              │                              │  ├─ pd.kp / pd.kd
              │  梯形速度规划 (200 Hz)       │  ├─ motion_profile.max_velocity
@@ -37,11 +103,10 @@
          ┌──────────┼──────────┐
     /dev/ttyUSB0  USB1      USB2
      arm_motor_1  _2        _3
-     (ID 0)      (ID 1)    (ID 2)
+     (ID 0)      (ID 0)    (ID 0)但是串口区分
 ```
 
-**注意**: 三个电机 ID 分别为 0、1、2，靠 `motors[].id` 字段在 `arm_config.yaml` 中配置，
-`motor_control_node` 按 `id` 字段路由到对应串口。
+
 
 ---
 
@@ -49,7 +114,7 @@
 
 | Topic | 方向 | 消息类型 | 频率 | 内容 |
 |-------|------|---------|:----:|------|
-| `/delta_arm/target` | 外部 → manager | `ArmTarget` | 不定 | `target_angles[3]`(rad), `execute` |
+| `/delta_arm/target` | 外部 → manager | `ArmTarget` | 不定 | `target_angles[3]`(Δrad，三路应一致), `execute` |
 | `unitree_go8010_command` | manager → motor | `UnitreeGO8010Command` | 200 Hz × 3 | FOC 全参数（物理空间） |
 | `unitree_go8010_states` | motor → manager | `UnitreeGO8010State` | 200 Hz × 3 | pos/vel/torque/temp/online |
 | `/delta_arm/ready` | manager → 外部 | `std_msgs/String` | 状态变化时 | `"READY"` |
@@ -63,7 +128,7 @@
 ```
 std_msgs/Header header
 
-float64[3] target_angles   # 三路电机目标角度（弧度，输出轴）
+float64[3] target_angles   # 三路电机目标相对增量（弧度），解耦模式要求三路一致
 bool execute               # true: 进入 EXECUTE 状态; false: 忽略本条消息
 ```
 
@@ -99,7 +164,7 @@ float32 kd              # 速度阻尼
           施加向下力矩                                                     │ 超时
           (torque_ff = downward_torque, kp=kd=0)                          │ (> landing_timeout)
                 │                                                          │
-                │ 三电机绝对角度均 < landing_angle_threshold               │
+                │ 三电机每周期角度变化量均 < landing_delta_threshold       │
                 │ 持续 landing_stable_duration                             │
                 │                                                          │
                 ▼                                                          │
@@ -124,7 +189,7 @@ float32 kd              # 速度阻尼
 | 当前状态 | 触发条件 | 目标状态 |
 |---------|---------|---------|
 | INIT | 第一个控制周期 | SOFT_LANDING |
-| SOFT_LANDING | 三电机 `\|pos\| < threshold` 持续 `stable_duration` | READY |
+| SOFT_LANDING | 三电机 `\|Δpos\| < threshold` 持续 `stable_duration` | READY |
 | SOFT_LANDING | 经过 `landing_timeout` 秒 | READY（超时警告） |
 | READY | 收到 `ArmTarget (execute=true)` | EXECUTE |
 | EXECUTE | 三电机误差均 `< position_tolerance` | READY |
@@ -146,7 +211,7 @@ float32 kd              # 速度阻尼
     ② 向三电机各发:
          UnitreeGO8010Command(id=motor_ids[i], mode=FOC,
            pos=0, vel=0, kp=0, kd=0, torque_ff=downward_torque)
-    ③ 检查着陆条件: ∀i: |current_positions[i]| < landing_angle_threshold
+    ③ 检查着陆条件: ∀i: |current_positions[i] - last_positions[i]| < landing_delta_threshold
        若满足且持续 landing_stable_duration → 进入 READY，发布 /delta_arm/ready
 
   case READY:
@@ -169,15 +234,16 @@ float32 kd              # 速度阻尼
 
 ## 6. 软着陆详解
 
-软着陆目的：在节点启动时安全地将三路电机驱动到零位参考点（绝对角 ≈ 0 rad），
-避免直接下发位置命令时因初始位置未知而产生冲击力矩。
+软着陆目的：在节点启动时通过小力矩下压使机构落稳，
+随后将当前物理角锁定为解耦零点，对外统一定义为 0 rad。
 
 ```
 施加力矩: torque_ff = downward_torque (默认 -1.0 Nm)
           kp = 0, kd = 0 → 纯力矩驱动
 
 判定着陆:
-  当三路电机绝对角度同时满足 |pos[i]| < landing_angle_threshold (默认 0.02 rad ≈ 1.1°)
+  当三路电机每控制周期的角度变化量同时满足
+  |pos[i]_k - pos[i]_{k-1}| < landing_delta_threshold (默认 0.02 rad)
   并且上述条件持续 landing_stable_duration (默认 0.5 s)
 
 超时保护:
@@ -192,18 +258,20 @@ float32 kd              # 速度阻尼
 梯形规划本质是对目标角度做一阶速度限幅积分，防止阶跃目标导致电机瞬间高速运动。
 
 ```
-每帧:
+每帧（解耦增量）:
   max_step = max_velocity * dt       // dt = 1/control_frequency
 
-  for i = 0, 1, 2:
-    err  = target[i] - planned[i]   // 规划位置与目标的差
-    step = clamp(err, -max_step, +max_step)
-    planned[i] += step              // 规划位置向目标靠近，每帧最多走 max_step
+  err  = target_delta - planned_delta
+  step = clamp(err, -max_step, +max_step)
+  planned_delta += step
 
-    → 下发 planned[i] 作为电机位置目标
+  for i = 0, 1, 2:
+    physical_target[i] = zero_position[i] + planned_delta
+
+    → 下发 physical_target[i] 作为电机位置目标
 
 到达判定:
-  |target[i] - current[i]| < position_tolerance (默认 0.05 rad)
+  |target_delta - (current[i]-zero_position[i])| < position_tolerance (默认 0.05 rad)
   三路同时满足 → 状态切回 READY
 ```
 
@@ -222,12 +290,13 @@ float32 kd              # 速度阻尼
 | `control_frequency` | double | 200.0 | 控制定时器频率（Hz） |
 | `initialization.downward_torque` | double | -1.0 | 软着陆施加力矩（Nm，负值向下） |
 | `initialization.landing_timeout` | double | 5.0 | 软着陆最长允许时间（s） |
-| `initialization.landing_angle_threshold` | double | 0.02 | 着陆判定角度阈值（rad） |
+| `initialization.landing_delta_threshold` | double | 0.02 | 着陆判定变化量阈值（rad） |
 | `initialization.landing_stable_duration` | double | 0.5 | 着陆稳定持续时间（s） |
 | `pd.kp` | double | 0.50 | READY/EXECUTE 阶段位置刚度 |
 | `pd.kd` | double | 0.10 | READY/EXECUTE 阶段速度阻尼 |
 | `motion_profile.max_velocity` | double | 2.0 | 梯形规划最大速度（rad/s） |
 | `position_tolerance` | double | 0.05 | 到达判定容差（rad） |
+| `decoupled_zero_rad` | double | 0.0 | 解耦控制坐标零点定义（固定 0） |
 | `safety.max_height` | double | 0.3 | 参考最大高度（m，仅记录，不限位） |
 | `motors[i].name` | string | `"arm_motor_i"` | 对应 `UnitreeGO8010State.joint_name` |
 | `motors[i].id` | uint8 | 0/1/2 | 发往 `UnitreeGO8010Command.id` |
@@ -240,7 +309,7 @@ control_frequency: 200.0
 initialization:
   downward_torque: -1.0
   landing_timeout: 5.0
-  landing_angle_threshold: 0.02
+  landing_delta_threshold: 0.02
   landing_stable_duration: 0.5
 
 pd:
@@ -291,8 +360,8 @@ initialization:
 # 着陆后仍有抖动 → 延长稳定时间
   landing_stable_duration: 1.0   # 原 0.5 s
 
-# 到底角度非常接近 0 → 收紧阈值
-  landing_angle_threshold: 0.01  # 原 0.02 rad
+# 落稳变化量更小 → 收紧阈值
+  landing_delta_threshold: 0.01  # 原 0.02 rad
 ```
 
 ### EXECUTE 位置跟踪调参
@@ -326,7 +395,7 @@ position_tolerance: 0.05   # rad ≈ 2.9°
 
 | 现象 | 可能原因 | 排查方法 |
 |------|---------|---------|
-| 节点卡在 SOFT_LANDING | 力矩太小，电机未能回到 0 位 | 加大 `\|downward_torque\|` 或延长 `landing_timeout` |
+| 节点卡在 SOFT_LANDING | 力矩太小，变化量降不下来 | 加大 `\|downward_torque\|` 或延长 `landing_timeout` |
 | EXECUTE 后未切回 READY | `position_tolerance` 太小或 kp 太弱 | 增大 tolerance 或 kp |
 | 电机命令发出但不响应 | `motors[i].id` 与硬件 ID 不匹配 | 检查 `arm_config.yaml → motors[i].id` 与实际电机拨码 |
 | 收到 ArmTarget 但不执行 | 当前状态非 READY | 等待 `/delta_arm/ready` 话题出现 `"READY"` 消息后再发送目标 |
@@ -338,9 +407,9 @@ position_tolerance: 0.05   # rad ≈ 2.9°
 
 | 方面 | 旧版 `delta_arm_node` | 新版 `delta_arm_manager` |
 |------|----------------------|--------------------------|
-| 控制接口 | `DeltaArmCommand (mode, height, vel_scale)` | `ArmTarget (target_angles[3], execute)` |
+| 控制接口 | `DeltaArmCommand (mode, height, vel_scale)` | `ArmTarget (target_angles[3]=同一Δrad, execute)` |
 | 初始化 | 无自动零位流程 | 自动软着陆 (SOFT_LANDING) |
 | 速度规划 | 由外部 `velocity_scale` 决定 | 内建梯形规划 (max_velocity) |
 | 就绪通知 | 无 | 发布 `/delta_arm/ready: "READY"` |
-| 逆运动学 | 有（高度 → 角度） | 无（直接输入三路目标角度） |
+| 逆运动学 | 有（高度 → 角度） | 无（输入统一相对增量Δrad） |
 | 配置文件 | `delta_arm.yaml` | `arm_config.yaml` |

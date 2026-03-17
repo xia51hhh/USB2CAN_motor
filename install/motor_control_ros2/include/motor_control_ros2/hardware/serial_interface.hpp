@@ -78,12 +78,13 @@ public:
   ssize_t send(const uint8_t* data, size_t len);
   
   /**
-   * @brief 接收数据（非阻塞）
+   * @brief 接收数据（带可控超时）
    * @param buffer 接收缓冲区
    * @param max_len 最大接收长度
+   * @param timeout_ms select 超时时间（毫秒，默认 20ms）
    * @return 实际接收的字节数，-1 表示错误
    */
-   ssize_t receive(uint8_t* buffer, size_t max_len);
+   ssize_t receive(uint8_t* buffer, size_t max_len, int timeout_ms = 20);
    
    /**
     * @brief 发送并接收（原子操作，匹配官方 SDK）

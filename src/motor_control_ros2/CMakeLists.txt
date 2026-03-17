@@ -20,14 +20,7 @@ find_package(yaml-cpp REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 
 
-# ================== 宇树官方 SDK 路径设置（可选，用于向后兼容） ==================
-# 原生协议实现不依赖SDK，但保留路径定义以备需要
-set(UNITREE_SDK_PATH "/home/toe/unitree_actuator_sdk")
-set(UNITREE_SDK_INCLUDE "${UNITREE_SDK_PATH}/include")
-set(UNITREE_SDK_LIB_DIR "${UNITREE_SDK_PATH}/lib") 
-# 注释掉SDK库，使用原生协议
-# set(UNITREE_SDK_LIB "${UNITREE_SDK_LIB_DIR}/libUnitreeMotorSDK_Linux64.so")
-# ========================================================
+
 
 # 消息生成（不再使用服务）
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -62,7 +55,7 @@ add_library(motor_control_lib
   # 电机驱动层
   src/dji_motor.cpp
   src/damiao_motor.cpp
-  src/unitree_motor.cpp
+  
   src/unitree_motor_native.cpp  # 原生协议宇树电机（主要使用）
   # 配置解析
   src/config_parser.cpp

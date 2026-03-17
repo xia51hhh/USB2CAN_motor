@@ -30,7 +30,13 @@ public:
 
 private:
   // ========== 状态机 ==========
-  enum class State { INIT, SOFT_LANDING, READY, EXECUTE };
+  enum class State {
+    WAIT_FEEDBACK,  // 新增：等待电机首帧反馈，不发任何命令
+    INIT,
+    SOFT_LANDING,
+    READY,
+    EXECUTE
+  };
 
   void controlLoop();
 
@@ -57,14 +63,18 @@ private:
   // ========== 配置参数 ==========
   double downward_torque_;           // 软着陆力矩 (Nm)
   double landing_timeout_;           // 软着陆超时 (s)
-  double landing_angle_threshold_;   // 着陆角度阈值 (rad)
+  double landing_velocity_threshold_; // 着陆速度阈值 (rad/s)
   double landing_stable_duration_;   // 稳定持续时间 (s)
+  double landing_kd_;                // 软着陆阻尼系数
   double kp_;
   double kd_;
   double max_velocity_;              // 梯形速度限幅 (rad/s)
   double control_frequency_;         // 控制频率 (Hz)
   double position_tolerance_;        // 到达判定容差 (rad)
+  double max_position_error_;        // 位置误差钳位 (rad)
+  double tracking_error_pause_;      // 自适应规划暂停阈值 (rad)
   std::array<std::string, 3> motor_names_;
+  std::array<std::string, 3> motor_devices_;
   std::array<uint8_t, 3> motor_ids_;
 
   // ========== 运行时状态 ==========
@@ -72,14 +82,20 @@ private:
   std::array<double, 3> current_positions_;    // rad
   std::array<double, 3> current_velocities_;   // rad/s
   std::array<bool, 3> motors_online_;
+  std::array<bool, 3> has_feedback_;
+  std::array<double, 3> last_positions_;       // 用于软着陆变化量判定
+  std::array<double, 3> zero_positions_;       // 解耦零点（软着陆完成时锁定）
 
-  std::array<double, 3> target_positions_;     // EXECUTE 目标 rad
-  std::array<double, 3> planned_positions_;    // 梯形规划当前位置 rad
+  double target_delta_rad_;                    // EXECUTE 目标增量（相对零点）
+  double planned_delta_rad_;                   // 梯形规划增量（相对零点）
 
   rclcpp::Time landing_stable_since_;
-  bool landing_stability_started_;
   rclcpp::Time init_start_time_;
+  bool landing_stability_started_;
   bool ready_published_;
+
+  double gravity_compensation_torque_;  // 重力补偿前馈力矩（用户自行调试）
+  int feedback_received_count_;
 };
 
 #endif  // MOTOR_CONTROL_ROS2__DELTA_ARM_MANAGER_NODE_HPP_

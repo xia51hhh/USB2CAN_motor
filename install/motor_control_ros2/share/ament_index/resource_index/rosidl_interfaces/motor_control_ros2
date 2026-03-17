@@ -1,7 +1,5 @@
-msg/ArmJointCommand.idl
-msg/ArmJointCommand.msg
-msg/ArmState.idl
-msg/ArmState.msg
+msg/ArmTarget.idl
+msg/ArmTarget.msg
 msg/ChassisCommand.idl
 msg/ChassisCommand.msg
 msg/ChassisState.idl

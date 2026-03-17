@@ -158,19 +158,19 @@ void SerialInterface::setRs485Direction(bool tx_mode) {
   ioctl(fd_, TIOCMSET, &level);
 }
 
-ssize_t SerialInterface::receive(uint8_t* buffer, size_t max_len) {
+ssize_t SerialInterface::receive(uint8_t* buffer, size_t max_len, int timeout_ms) {
   if (fd_ < 0) {
     return -1;
   }
   
-  // 使用 select 等待数据，超时时间为 20ms（宇树电机通常在 1-5ms 内返回反馈，但留有余量）
+  // 使用 select 等待数据，超时时间由调用者控制
   fd_set readfds;
   FD_ZERO(&readfds);
   FD_SET(fd_, &readfds);
   
   struct timeval tv;
-  tv.tv_sec = 0;
-  tv.tv_usec = 20000;  // 20ms 超时（从 10ms 增加）
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
   
   int select_result = select(fd_ + 1, &readfds, NULL, NULL, &tv);
   
@@ -221,8 +221,18 @@ ssize_t SerialInterface::sendRecvAccumulate(const uint8_t* send_data, size_t sen
     return -1;
   }
 
-  // 半双工请求-响应：发送前清理 RX 缓冲，避免读取到断电噪声/残包
-  tcflush(fd_, TCIFLUSH);
+  // === USB FIFO 轻量排空 ===
+  // tcflush + 非阻塞读即可。BUF_SIZE=48 已能容纳帧+噪声前缀，
+  // 帧扫描会在48字节中找到有效帧，无需usleep等待。
+  {
+    uint8_t trash[64];
+    tcflush(fd_, TCIOFLUSH);
+    // 快速非阻塞读，清除已在内核缓冲区的残留
+    for (int drain = 0; drain < 2; ++drain) {
+      ssize_t drained = read(fd_, trash, sizeof(trash));
+      if (drained <= 0) break;
+    }
+  }
 
   // 发送
   ssize_t n = send(send_data, send_len);
@@ -230,34 +240,34 @@ ssize_t SerialInterface::sendRecvAccumulate(const uint8_t* send_data, size_t sen
     return -1;
   }
 
-  // 等待电机准备响应
+  // 给从机留处理时间
   if (wait_ms > 0) {
     std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
   }
 
-  // 累积接收直到超时或达到上限
-  const auto start = std::chrono::steady_clock::now();
   size_t total = 0;
+  auto start = std::chrono::steady_clock::now();
 
   while (total < max_len) {
-    const auto now = std::chrono::steady_clock::now();
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
     if (elapsed_ms >= timeout_ms) {
       break;
     }
 
-    ssize_t r = receive(recv_buffer + total, max_len - total);
+    // 计算剩余超时，传给 receive 避免 select 阻塞超过外部 timeout
+    int remaining_ms = timeout_ms - static_cast<int>(elapsed_ms);
+    if (remaining_ms < 1) remaining_ms = 1;
+
+    ssize_t r = receive(recv_buffer + total, max_len - total, remaining_ms);
     if (r > 0) {
       total += static_cast<size_t>(r);
+      // 收到数据后继续短暂累积，尽量拼完整帧
       continue;
     }
 
-    if (r < 0) {
-      return -1;
-    }
-
-    // r == 0: 当前轮无数据，短暂让出 CPU
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // 无数据时小睡，避免 busy loop
+    break;
   }
 
   return static_cast<ssize_t>(total);

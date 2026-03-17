@@ -147,3 +147,11 @@ kinematics:
   
   # 优化权重：[位置误差, 姿态误差, 关节角度变化]
   optimization_weights: [1.0, 0.5, 0.1]
+
+# 传动参数（与 motors.yaml 的 gear_ratio 语义保持一致）
+transmission:
+  # gear_ratio 定义：电机转子角 / 关节输出角（减速比）
+  # 位置/速度换算：joint = motor / gear_ratio
+  # 力矩换算：joint_torque ≈ motor_torque * gear_ratio * efficiency
+  # 若未做单独建模，保持 1.0 表示直驱近似
+  gear_ratio_hint: [1.0, 1.0, 1.0, 1.0]  # [左主, 左副, 右主, 右副]

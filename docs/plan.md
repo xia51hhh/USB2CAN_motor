@@ -1,5 +1,7 @@
 # 最终方案 Plan
 
+<!-- usage-note -->
+
 ## 问题一：串口热插拔修复
 
 ### 状态：✅ 已完成
@@ -195,3 +197,262 @@ motor_offsets_rad:
 - 解耦初始化弧度固定 0。
 - 控制只看变化量，不看绝对角。
 - 三电机变化量始终一致。
+
+---
+
+## 问题六：`ArmTarget.msg` 导致编译失败
+
+### 状态：✅ 已修复
+
+### 根因
+- `float target64_angles` 不是合法 ROS2 msg 类型定义（`float` 非法）。
+- 字段也与既定接口不一致，正确应为 `float64[3] target_angles`。
+
+### 修复
+- 将 `src/motor_control_ros2/msg/ArmTarget.msg` 修改为：
+  - `float64[3] target_angles`
+  - `bool execute`
+
+### 验证
+1. `colcon build --packages-select motor_control_ros2`
+2. `ros2 interface show motor_control_ros2/msg/ArmTarget`
+3. 确认字段为：
+   - `std_msgs/Header header`
+   - `float64[3] target_angles`
+   - `bool execute`
+
+---
+
+## 问题七：`motor_control_node.cpp` 语法污染导致编译失败
+
+### 状态：✅ 已修复
+
+### 根因
+- 变量声明被污染：`doublemotor_id actual_control_freq_ = 0.0;`
+- 类结尾被污染：`};motor_id`
+
+### 修复
+- 改为 `double actual_control_freq_ = 0.0;`
+- 改为正常类结尾 `};`
+
+### 验证
+1. `colcon build --packages-select motor_control_ros2`
+2. 确认不再出现 `does not name a type` 与 `actual_control_freq_ was not declared`。
+
+---
+
+## 问题八：`motor_control_node.cpp` 缺少命名空间闭合导致编译失败
+
+### 状态：✅ 已修复
+
+### 根因
+-  `namespace motor_control {` 未在文件末尾闭合，触发：
+  - `expected '}' at end of input`
+
+### 修复
+- 在文件末尾补充：
+  - `}  // namespace motor_control`
+  - `main()` 入口函数（创建并 spin `MotorControlNode`）
+
+### 验证
+1. `colcon build --packages-select motor_control_ros2`
+2. 确认不再出现 `expected '}' at end of input`。
+
+---
+
+## 问题九：3 台电机不同步——逐个站起来（2026-03-16 委员会决议）
+
+### 状态：🔧 修复中
+
+### 委员会诊断（3 Sub-Agent 一致通过）
+
+**根因三层叠加：**
+
+| 层级 | 根因 | 影响 |
+|------|------|------|
+| **层级 1（主因）** | `downward_torque = -0.05 Nm` 转子侧，输出端仅 0.317 Nm ≈ 静摩擦力矩边界 | 摩擦不同的电机下降速度完全不同 |
+| **层级 2** | 串口顺序阻塞 30ms，实际频率 ~33Hz | 着陆检测"幻影稳定" bug |
+| **层级 3** | `allMotorsLanded()` 用位置差分而非速度反馈 | 缓慢运动时过早误判着陆 |
+
+### 修复措施
+
+#### 🔴 P0（立即执行）
+1. **增大力矩**: `downward_torque` -0.05 → -0.15（输出端 0.95 Nm，远超静摩擦上限）
+2. **SOFT_LANDING 加阻尼**: 发送命令 kd=0.05（τ = τ_ff + Kd(0-ω)，自动限速）
+3. **着陆判定改用速度**: `abs(current_velocity) < 0.3 rad/s` 替代位置差分
+
+#### 🟠 P1（串口优化）
+4. `wait_ms` 2→0, `timeout_ms` 8→3（每台电机耗时 10ms→3ms）
+
+#### 🟡 P2（EXECUTE 调优）
+5. `kp` 0.40→0.20, `kd` 0.02→0.05（kp/kd=4 接近临界阻尼）
+
+### 修改文件
+- `config/arm_config.yaml`
+- `src/delta_arm_manager_node.cpp`
+- `src/motor_control_node.cpp`
+
+---
+
+## 问题十：`fails_total` 看起来很高，但不等于最终失败率
+
+### 状态：🔍 已澄清口径
+
+### 结论
+- `arm_motor_2: 638/1400`
+- `arm_motor_3: 441/1400`
+
+这两个数字更可能表示：
+- **首次通信失败/触发重试的比例**
+而不是：
+- **最终命令执行失败的比例**
+
+因为当前现象已明确为“**通过重试恢复 ✅**”。
+
+### 正确理解
+- `638/1400 ≈ 45%`：约 45% 的控制周期第一次 `sendRecv` 没成功
+- 若第二/第三次重试成功，则该周期**最终并未失败**
+- 因此该指标本质更接近“**重试率**”，不是“**最终失败率**”
+
+### 可能原因
+1. 串口超时窗口仍偏紧
+2. USB-RS485 适配器存在调度/延迟抖动
+3. RS485 半双工收发切换时序较边缘
+4. 线缆、供电、接地或噪声导致首帧偶发损坏
+5. 顺序轮询下，后两路更容易出现首轮超时
+
+### 后续应统计的指标
+- `first_try_fail_total`
+- `retry_recovered_total`
+- `final_fail_total`
+- `timeout_total`
+- `parse_fail_total`
+- `consecutive_fail_max`
+
+### 判断标准
+- 若 `final_fail_total` 很低，且电机在线稳定、动作无异常，则当前问题主要是**链路裕量不足**，不是功能性故障。
+- 若 `final_fail_total` 也高，才说明需要继续处理物理层或超时参数。
+
+---
+
+## 问题十一：motor_2/3 首次通信失败率 31-45% — 串口超时太紧
+
+### 状态：✅ 已修复
+
+### 根因
+- `wait_ms=2, timeout_ms=8` 对 ttyUSB1/2 的 USB-RS485 适配器偏紧
+- motor_1 换到 ttyUSB3 后 0% 失败，说明不同适配器响应延迟差异大
+- 首次超时后重试能成功，证明不是协议/硬件故障，纯粹是时间窗不够
+
+### 修复
+- `wait_ms` 2 → 4（给适配器收发切换更多时间）
+- `timeout_ms` 8 → 12（给慢适配器留余量）
+- 在 `arm_config.yaml` 新增 `serial.wait_ms` / `serial.timeout_ms` 可配置
+
+### 频率影响
+- 单台电机轮询耗时：~10ms → ~16ms
+- 3台总计：~30ms → ~48ms
+- 等效控制频率：~33Hz → ~20Hz（机械臂场景足够）
+
+### 验证
+1. 重新编译运行
+2. 观察 `fails_total`，预期 motor_2/3 首次失败率降到 <5%
+3. 如仍偏高，可继续放宽到 `wait_ms=5, timeout_ms=15`
+
+---
+
+## 问题十二：构建问题快速排查（固定流程）
+
+### 状态：🔄 执行中
+
+### 固定命令
+1. `colcon build --packages-select motor_control_ros2 --event-handlers console_direct+`
+2. `colcon build --packages-select motor_control_ros2 --cmake-clean-cache`
+3. `rm -rf build/motor_control_ros2 install/motor_control_ros2 log && colcon build --packages-select motor_control_ros2`
+
+### 重点检查
+- `msg` 字段类型是否为 ROS2 合法类型（如 `float64`、`float64[3]`）
+- `CMakeLists.txt` 是否包含新源文件与 `rosidl` 生成项
+- `package.xml` 是否声明对应依赖
+- 节点源文件是否闭合 `namespace` 且包含 `main()`
+
+---
+
+## 问题十三：`gear_ratio` 参数语义
+
+### 定义
+`gear_ratio` = 电机转子转角 / 关节输出转角（减速比）。
+
+### 换算关系
+- `joint_position = motor_position / gear_ratio`
+- `joint_velocity = motor_velocity / gear_ratio`
+- `joint_torque ≈ motor_torque * gear_ratio * efficiency`
+
+### 配错后现象
+- 位置比例错误（指令 10° 实际不是 10°）
+- 速度估计偏差
+- 力矩/负载判断失真，可能影响控制稳定性
+
+---
+
+## 问题十四：上电后无命令电机就动（残留命令 bug）
+
+### 状态：✅ 已修复
+
+### 根因
+- `delta_arm_manager` 启动后立即进入 INIT→SOFT_LANDING，马上发命令
+- 但此时电机反馈尚未到达，`zero_positions_` 全为 0
+- 导致发出的位置命令与电机实际位置不符，电机瞬间跳动
+
+### 修复
+- 新增 `WAIT_FEEDBACK` 状态，作为状态机第一阶段
+- 在所有 3 台电机都返回有效反馈前，**不发送任何命令**
+- 电机在无命令期间保持 brake/自由状态
+
+### 验证
+- 上电后电机应保持静止，直到日志出现"3台电机反馈就绪"
+
+---
+
+## 问题十五：重力补偿前馈接口（用户自行调试）
+
+### 状态：✅ 接口已就绪
+
+### 新增配置
+```yaml
+initialization:
+  gravity_compensation_torque: 0.0  # 用户自行调试
+```
+
+### 使用方法
+- READY 和 EXECUTE 阶段的 `torque_ff` 会加上此值
+- 正值向上抵抗重力
+- 建议从 0.05 开始，观察 READY 状态是否下沉，逐步增大
+- 调试时注意：这是**转子侧力矩**，输出端 = 值 × gear_ratio（GO8010 约 6.33）
+
+---
+
+## 问题十：传输堵塞 — 串口I/O阻塞主控制循环
+
+### 状态：🔧 进行中（2026-03-17）
+
+### 根因分析
+- `controlLoop()`（200Hz=5ms周期）中 `writeUnitreeNativeMotors()` 顺序轮询3个串口电机
+- 每个电机通信耗时 ~4-16ms（wait_ms=4 + timeout_ms=12）
+- 3电机最少 12ms，最坏含重试 192ms → 远超 5ms 周期
+- SingleThreadedExecutor 被 I/O 锁死，ROS2 订阅回调无法处理 → 命令堆积覆盖
+
+### 修复方案
+1. **P0**: 为每个串口接口创建独立通信线程，三串口并行收发
+2. **P1**: timeout_ms 从 12 降至 8
+3. **P2**: publishCommand 添加 torque_ff 限幅保护
+
+### 修改文件
+- `src/motor_control_ros2/src/motor_control_node.cpp`
+- `src/motor_control_ros2/src/delta_arm_manager_node.cpp`
+- `src/motor_control_ros2/config/arm_config.yaml`
+
+### 预期效果
+- 控制循环恢复真正 200Hz（<2ms/周期）
+- 串口通信频率 ~200Hz（三路并行，每路 ~4ms）
+- ROS 回调不再被饿死，命令即时送达电机

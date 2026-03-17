@@ -5,6 +5,7 @@
 #include <map>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 #include "motor_control_ros2/motor_base.hpp"
 #include "motor_control_ros2/dji_motor.hpp"
@@ -148,12 +149,18 @@ public:
     // 初始化频率统计
     last_freq_report_time_ = this->now();
     last_dji_tx_report_time_ = this->now();
+
+    // 启动串口独立通信线程（每个串口接口一个线程，并行收发，不阻塞主控制循环）
+    startSerialThreads();
     
-    RCLCPP_INFO(this->get_logger(), "电机控制节点已启动 - 控制频率: %.1f Hz, 宇树电机(原生): %zu",
-                control_freq, unitree_native_motors_.size());
+    RCLCPP_INFO(this->get_logger(), "电机控制节点已启动 - 控制频率: %.1f Hz, 宇树电机(原生): %zu, 串口线程: %zu",
+                control_freq, unitree_native_motors_.size(), serial_comm_threads_.size());
   }
   
   ~MotorControlNode() {
+    // 先停止串口通信线程
+    stopSerialThreads();
+
     can_network_->stopAll();
     can_network_->closeAll();
     
@@ -377,15 +384,15 @@ private:
       motor->updateController();
     }
     
-    // 2. 写入电机命令（宇树电机协议：先发送命令，电机才会返回反馈）
+    // 2. 写入 CAN 电机命令
     writeDJIMotors();
     writeDamiaoMotors();
     
-    // 3. 宇树电机（原生协议）- SendRecv 同步模式
-    writeUnitreeNativeMotors();
+    // 3. 宇树电机（原生协议）— 已移至独立串口线程并行通信
+    //    每个串口接口一个线程，三路并行，不再阻塞主控制循环
+    //    反馈数据由串口线程实时更新到 UnitreeMotorNative 内部状态
     
-   
-    // 5. 发布电机状态（每次控制循环都发布）
+    // 4. 发布电机状态（每次控制循环都发布）
     publishStates();
   }
 
@@ -393,80 +400,167 @@ private:
  
   
   /**
-   * @brief 写入宇树电机命令（原生协议）
+   * @brief 串口通信线程函数（每个串口接口一个线程，并行收发）
    *
-   * 分层架构（对齐 CAN 侧 DJIMotor + CANInterface）：
-   * 1. 协议层（UnitreeMotorNative）：构建命令包
+   * 架构改进：从主控制循环中解耦串口 I/O
+   * - 旧架构：controlLoop → writeUnitreeNativeMotors（阻塞 15-48ms）→ 主循环降至 20-60Hz
+   * - 新架构：独立线程并行轮询，主循环恢复 200Hz，串口每路 ~200Hz
+   *
+   * 分层不变：
+   * 1. 协议层（UnitreeMotorNative）：构建命令包 / 解析反馈包（mutex 保护）
    * 2. 硬件层（SerialInterface）：发送接收
-   * 3. 协议层（UnitreeMotorNative）：解析反馈包
    */
-  void writeUnitreeNativeMotors() {
-    constexpr size_t FRAME_LEN = 16;    // 宇树 GO-M8010-6 反馈帧固定长度
-    constexpr size_t BUF_SIZE  = 48;    // 留余量：16字节帧 + 最多32字节噪声前缀
+  void serialInterfaceLoop(const std::string& iface_name,
+                           std::vector<std::shared_ptr<UnitreeMotorNative>> motors) {
+    constexpr size_t FRAME_LEN = 16;
+    constexpr size_t BUF_SIZE  = 48;
 
-    for (auto& motor : unitree_native_motors_) {
-      auto serial = serial_network_->getInterface(motor->getInterfaceName());
-      if (!serial || !serial->isOpen()) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                            "[UnitreeNative] %s: 串口未就绪 (%s)",
-                            motor->getJointName().c_str(), motor->getInterfaceName().c_str());
-        continue;
-      }
+    RCLCPP_INFO(this->get_logger(),
+        "[Serial Thread] 启动: %s, 电机数: %zu", iface_name.c_str(), motors.size());
 
-      // 协议层：构建命令包
-      uint8_t cmd[17];
-      motor->getCommandPacket(cmd);
+    // 线程局部诊断计数器（避免 static map 的线程安全问题）
+    std::map<std::string, int> poll_cnt;
+    std::map<std::string, int> diag_cnt;
+    std::map<std::string, int> fail_cnt;
 
-      // 尝试一次发送接收 + 帧扫描解析
-      // 返回 true 表示成功解析到一帧有效反馈
-      // 注意：max_len 传入 FRAME_LEN 而非 BUF_SIZE，收到完整16字节帧即退出
-      //       wait_ms=2：4Mbps 下命令发送+电机处理约 1-2ms
-      //       timeout_ms=8：8ms 墙钟超时，远小于控制周期 5ms×n
-      auto try_recv_parse = [&](uint8_t (&buf)[BUF_SIZE]) -> bool {
-        ssize_t n = serial->sendRecvAccumulate(cmd, 17, buf, FRAME_LEN, 2, 8);
-        if (n <= 0) return false;
+    while (serial_running_.load(std::memory_order_relaxed)) {
+      for (auto& motor : motors) {
+        if (!serial_running_.load(std::memory_order_relaxed)) break;
 
-        // 帧扫描：在收到的数据中搜索 0xFD 0xEE 帧头
-        for (ssize_t off = 0; off + static_cast<ssize_t>(FRAME_LEN) <= n; ++off) {
-          if (buf[off] == 0xFD && buf[off + 1] == 0xEE) {
-            if (motor->parseFeedback(&buf[off], FRAME_LEN)) {
-              return true;
+        auto serial = serial_network_->getInterface(iface_name);
+        if (!serial || !serial->isOpen()) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                              "[Serial Thread] %s: 串口未就绪 (%s)",
+                              motor->getJointName().c_str(), iface_name.c_str());
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+        }
+
+        // 诊断：轮询计数
+        auto& pcnt = poll_cnt[motor->getJointName()];
+        pcnt++;
+        if (pcnt % 200 == 1) {
+          fprintf(stderr, "[DIAG-T] %s poll#%d iface=%s isOpen=%d\n",
+                  motor->getJointName().c_str(), pcnt,
+                  iface_name.c_str(), serial->isOpen() ? 1 : 0);
+        }
+
+        // 协议层：构建命令包
+        uint8_t cmd[17];
+        motor->getCommandPacket(cmd);
+
+        uint8_t response[BUF_SIZE];
+        ssize_t last_n = 0;
+
+        // 发送接收 + 帧扫描解析
+        // wait_ms=4: USB适配器往返需要~3-4ms，实测4ms→0%失败
+        // timeout_ms=8: 缩短超时（原12ms），数据在wait后几乎立即到达
+        auto try_recv_parse = [&](uint8_t (&buf)[BUF_SIZE]) -> bool {
+          ssize_t n = serial->sendRecvAccumulate(cmd, 17, buf, BUF_SIZE, 4, 8);
+          last_n = n;
+          if (n <= 0) return false;
+          for (ssize_t off = 0; off + static_cast<ssize_t>(FRAME_LEN) <= n; ++off) {
+            if (buf[off] == 0xFD && buf[off + 1] == 0xEE) {
+              if (motor->parseFeedback(&buf[off], FRAME_LEN)) {
+                return true;
+              }
             }
           }
+          return false;
+        };
+
+        bool ok = try_recv_parse(response);
+
+        // 诊断：通信结果（每秒打印一次）
+        auto& dcnt = diag_cnt[motor->getJointName()];
+        auto& fails = fail_cnt[motor->getJointName()];
+        dcnt++;
+        if (!ok) fails++;
+        if (dcnt % 200 == 0) {
+          fprintf(stderr, "[DIAG-T] %s: poll#%d ok=%d last_n=%zd fails=%d head=[",
+                  motor->getJointName().c_str(), dcnt, ok ? 1 : 0, last_n, fails);
+          for (ssize_t i = 0; i < std::min(last_n, (ssize_t)8); ++i) {
+            fprintf(stderr, "%02X ", response[i]);
+          }
+          fprintf(stderr, "]\n");
         }
-        return false;
-      };
 
-      uint8_t response[BUF_SIZE];
-      bool ok = try_recv_parse(response);
+        if (!ok) {
+          // 优化重试：仅重试一次（减少延迟放大），不再重试3次
+          ok = try_recv_parse(response);
+          if (ok) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[Serial Thread] %s: 重试成功", motor->getJointName().c_str());
+          } else {
+            std::string hex_dump;
+            for (ssize_t i = 0; i < std::min(last_n, (ssize_t)8); ++i) {
+              char hex[8];
+              snprintf(hex, sizeof(hex), "%02X ", response[i]);
+              hex_dump += hex;
+            }
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[Serial Thread] %s: 通信失败 (recv=%zd bytes, head=[%s]) iface=%s",
+                motor->getJointName().c_str(), last_n,
+                hex_dump.c_str(), iface_name.c_str());
+          }
+        }
 
-      if (!ok) {
-        // 热插拔恢复：重试 1 次（flush 已在 sendRecvAccumulate 内部执行）
-        bool recovered = try_recv_parse(response);
-        if (recovered) {
+        if (ok) {
           RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                              "[UnitreeNative] %s: [HOT_PLUG] 热插拔恢复成功（重试1次）",
-                              motor->getJointName().c_str());
-          ok = true;
-        } else {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                              "[UnitreeNative] %s: 通信失败", motor->getJointName().c_str());
+              "[Serial Thread] %s: Pos=%.3f° Vel=%.3f rad/s Tor=%.3f Nm Tmp=%d°C Online=%d",
+              motor->getJointName().c_str(),
+              motor->getOutputPosition() * 180.0 / M_PI,
+              motor->getOutputVelocity(),
+              motor->getOutputTorque(),
+              (int)motor->getTemperature(),
+              motor->isOnline() ? 1 : 0);
         }
       }
-
-      if (ok) {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[UnitreeNative] %s: Pos=%.3f° Vel=%.3f rad/s Tor=%.3f Nm Tmp=%d°C Online=%d",
-                    motor->getJointName().c_str(),
-                    motor->getOutputPosition() * 180.0 / M_PI,
-                    motor->getOutputVelocity(),
-                    motor->getOutputTorque(),
-                    (int)motor->getTemperature(),
-                    motor->isOnline() ? 1 : 0);
-      }
+      // 无需额外 sleep — sendRecvAccumulate 本身已耗时 ~4ms/电机
     }
+
+    RCLCPP_INFO(this->get_logger(), "[Serial Thread] 退出: %s", iface_name.c_str());
   }
-  
+
+  /**
+   * @brief 启动串口并行通信线程（每个串口接口一个线程）
+   */
+  void startSerialThreads() {
+    if (unitree_native_motors_.empty()) return;
+
+    // 按串口接口名称分组电机
+    std::map<std::string, std::vector<std::shared_ptr<UnitreeMotorNative>>> iface_motors;
+    for (auto& motor : unitree_native_motors_) {
+      iface_motors[motor->getInterfaceName()].push_back(motor);
+    }
+
+    serial_running_.store(true, std::memory_order_release);
+
+    for (auto& [name, motors] : iface_motors) {
+      serial_comm_threads_.emplace_back(
+          &MotorControlNode::serialInterfaceLoop, this, name, motors);
+      RCLCPP_INFO(this->get_logger(),
+          "[Serial] 为接口 %s 启动独立通信线程（%zu 个电机）",
+          name.c_str(), motors.size());
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+        "[Serial] 共启动 %zu 个串口并行通信线程（三路并行，不再阻塞主循环）",
+        serial_comm_threads_.size());
+  }
+
+  /**
+   * @brief 停止所有串口通信线程
+   */
+  void stopSerialThreads() {
+    serial_running_.store(false, std::memory_order_release);
+    for (auto& t : serial_comm_threads_) {
+      if (t.joinable()) t.join();
+    }
+    serial_comm_threads_.clear();
+    RCLCPP_INFO(this->get_logger(), "[Serial] 所有串口通信线程已停止");
+  }
+
   void writeDJIMotors() {
     if (dji_motors_.empty()) 
     {return;}
@@ -661,7 +755,7 @@ private:
   }
   
   void unitreeCommandCallback(const motor_control_ros2::msg::UnitreeMotorCommand::SharedPtr /*msg*/) {
-    // SDK版本已禁用，使用 unitreeGOCommandCallback 和原生协议版本
+    // SDK版本已禁用，使用 unitreeGOCommand 和原生协议版本
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "[CMD] UnitreeMotorCommand 已禁用，请使用 UnitreeGO8010Command");
   }
@@ -947,10 +1041,16 @@ private:
   // DJI 发送频率统计（成员变量，避免 static 问题）
   int dji_tx_count_ = 0;
   rclcpp::Time last_dji_tx_report_time_;
+
+  // 串口通信线程（每个串口接口一个线程，并行收发）
+  std::vector<std::thread> serial_comm_threads_;
+  std::atomic<bool> serial_running_{false};
 };
 
-} // namespace motor_control
+// 补齐 namespace 闭合
+}  // namespace motor_control
 
+// 补齐可执行入口
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<motor_control::MotorControlNode>();
