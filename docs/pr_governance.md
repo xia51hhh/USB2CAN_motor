@@ -20,9 +20,11 @@
 
 在 `Settings -> Branches -> Branch protection rules` 中开启：
 
+- Branch name pattern：建议填写默认分支（如 `main` 或 `master`）；仅填写 `pr` 会显示 `Applies to 0 branches`（除非仓库里确实有名为 `pr` 的分支）。
 - Require a pull request before merging
 - Require approvals（至少 1 人）
 - Require status checks to pass before merging：
   - PR CI
   - PR Title Check
   - CodeQL
+- Require branches to be up to date before merging（建议勾选）
