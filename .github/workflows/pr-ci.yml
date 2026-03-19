@@ -60,6 +60,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Hold Firefox to avoid snap installation
+        run: |
+          sudo apt-mark hold firefox firefox-locale-en firefox-locale-zh-hans firefox-locale-zh-hant || true
+
       - name: Setup ROS 2 Humble
         uses: ros-tooling/setup-ros@v0.7
         with:
