@@ -148,8 +148,13 @@ jobs:
             const formatError = (error) => String(error?.message || error).replace(/\s+/g, ' ').trim()
             const isApprovalPermissionError = (error) =>
               /GitHub Actions is not permitted to approve pull requests\./i.test(formatError(error))
-            const isWorkflowPermissionError = (error) =>
-              /without `workflows` permission/i.test(formatError(error))
+            const isWorkflowPermissionError = (error) => {
+              const message = formatError(error)
+              return (
+                /refusing to allow a github app to create or update \bworkflow\b/i.test(message) ||
+                /create or update \bworkflow\b .* without `?\bworkflows\b`? permission/i.test(message)
+              )
+            }
 
             const renderResult = (result) => {
               switch (result) {
@@ -331,7 +336,7 @@ jobs:
                 }
               } catch (error) {
                 if (isWorkflowPermissionError(error)) {
-                  automationLines.push('- Squash auto-merge：跳过（缺少 workflows 权限，需要维护者手动启用）')
+                  automationLines.push('- Squash auto-merge：跳过（检测到 workflow 权限限制，需维护者手动启用）')
                 } else {
                   const message = `启用 squash auto-merge 失败：${formatError(error)}`
                   automationLines.push(`- Squash auto-merge：失败（${formatError(error)}）`)
