@@ -413,6 +413,7 @@ ros2 run motor_control_ros2 motor_control_node
 - 同仓库 PR 和 fork PR 都会执行相同检查
 - 固定汇总评论会被更新，不会重复新增多条评论
 - 自动审批与 squash auto-merge 也会尝试覆盖 fork PR，但是否最终生效仍取决于仓库权限、branch protection 与 GitHub 对 fork PR 的限制
+- 建议首次启用后用一个最小 docs PR 做 smoke test，确认固定评论、bot approval 和 squash auto-merge 均正常工作
 
 建议在仓库 Settings → Branches 中确认：
 
