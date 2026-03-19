@@ -197,6 +197,7 @@ fork PR 与同仓库 PR 的共同点：
 - 检查结果可以信任
 - 评论更新通常可以成功
 - 自动化合并能力以仓库当前权限配置和 GitHub 平台限制为准
+- 若 PR 修改了 `.github/workflows/*`，启用 auto-merge 还需要 `workflows: write` 权限；否则会在 `PR automation` 中提示需维护者手动启用
 
 ## PR 模板填写规范
 

@@ -422,6 +422,7 @@ ros2 run motor_control_ros2 motor_control_node
 - 固定汇总评论会被更新，不会重复新增多条评论
 - 当前仓库要实现全自动合并，应以 `PR gate` 为唯一门禁，并关闭强制 approvals / 强制 Code Owner approvals
 - GitHub Actions 可能不被允许直接 approve PR；这不会影响当前“检查通过后自动 squash 合并”的主流程
+- 若 PR 修改了 `.github/workflows/*`，自动启用 squash auto-merge 需要额外 `workflows` 权限；权限不足时会提示由维护者手动启用
 
 建议在仓库 Settings → Branches 中确认：
 
